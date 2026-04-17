@@ -6,6 +6,10 @@
   const UNGROUPED_ID = '__ungrouped__';
   const GROUPING_CLASS = 'st-rmg-grouping';
   const HIDDEN_CLASS = 'st-rmg-hidden';
+  const FOLDER_LABEL = '文件夹';
+  const UNGROUPED_LABEL = '未分组';
+  const STATE_ENABLED = 'enabled';
+  const STATE_DISABLED = 'disabled';
 
   function log(...args) {
     console.log(`[${MODULE_NAME}]`, ...args);
@@ -23,6 +27,17 @@
   function getCtx() {
     return window.SillyTavern?.getContext?.();
   }
+
+  function getSelectedRegexPreset(ctx = getCtx()) {
+    const presets = ctx?.extensionSettings?.regex_presets;
+    if (!Array.isArray(presets)) return null;
+    return presets.find((preset) => preset?.isSelected) || null;
+  }
+
+  function getRegexPresetManager(ctx = getCtx()) {
+    return ctx?.getPresetManager?.('regex') || null;
+  }
+
 
   function loadJson(key, fallback) {
     try {
@@ -164,7 +179,9 @@
       version: STORAGE_VERSION,
       groups: [],
       assignments: {},
-      collapsed: {}
+      collapsed: {},
+      disabledFolders: {},
+      disabledSnapshots: {}
     };
   }
 
@@ -173,11 +190,13 @@
     const rawGroups = Array.isArray(source.groups) ? source.groups : [];
     const assignments = source.assignments && typeof source.assignments === 'object' ? source.assignments : {};
     const collapsed = source.collapsed && typeof source.collapsed === 'object' ? source.collapsed : {};
+    const disabledFolders = source.disabledFolders && typeof source.disabledFolders === 'object' ? source.disabledFolders : {};
+    const disabledSnapshots = source.disabledSnapshots && typeof source.disabledSnapshots === 'object' ? source.disabledSnapshots : {};
 
     const groups = rawGroups
       .map((group, index) => ({
         id: String(group?.id || uid('group')),
-        name: normalizeName(group?.name) || '未命名分组',
+        name: normalizeName(group?.name) || `未命名${FOLDER_LABEL}`,
         order: Number.isFinite(group?.order) ? Number(group.order) : index
       }))
       .slice(0, 500);
@@ -194,6 +213,23 @@
         Object.entries(collapsed)
           .filter(([key]) => !!key)
           .map(([key, value]) => [String(key), !!value])
+      ),
+      disabledFolders: Object.fromEntries(
+        Object.entries(disabledFolders)
+          .filter(([key]) => !!key)
+          .map(([key, value]) => [String(key), !!value])
+      ),
+      disabledSnapshots: Object.fromEntries(
+        Object.entries(disabledSnapshots)
+          .filter(([key, value]) => !!key && value && typeof value === 'object')
+          .map(([key, value]) => [
+            String(key),
+            Object.fromEntries(
+              Object.entries(value)
+                .filter(([itemId]) => !!itemId)
+                .map(([itemId, itemValue]) => [String(itemId), !!itemValue])
+            )
+          ])
       )
     };
   }
@@ -226,8 +262,9 @@
     const ctx = getCtx();
 
     if (scope === 'preset') {
-      const apiId = window.getCurrentPresetAPI?.() ?? ctx?.getCurrentPresetAPI?.() ?? 'no-api';
-      const presetName = window.getCurrentPresetName?.() ?? ctx?.getCurrentPresetName?.() ?? 'no-preset';
+      const presetManager = getRegexPresetManager(ctx);
+      const apiId = presetManager?.apiId ?? 'no-api';
+      const presetName = presetManager?.getSelectedPresetName?.() ?? 'no-preset';
       return `preset:${keySegment(apiId, 'no-api')}:${keySegment(presetName, 'no-preset')}`;
     }
 
@@ -256,6 +293,10 @@
     let sorting = false;
     let sortingItemId = '';
     let sortingTargetGroupId = undefined;
+    let draggingFolderId = '';
+    let folderDropTargetId = '';
+    let folderDropAfter = false;
+    let lastFolderDragEndedAt = 0;
     let lastRenderedGroupSignature = '';
     let selectedGroupId = UNGROUPED_ID;
     let panelCollapsed = !!loadJson(PANEL_COLLAPSED_KEY, false);
@@ -307,6 +348,171 @@
       return getSortedGroups(store.groups);
     }
 
+    function getFolderState(groupId, items = collectItems()) {
+      const folderItems = groupId === UNGROUPED_ID
+        ? items.filter((item) => !store.assignments[item.id])
+        : items.filter((item) => store.assignments[item.id] === groupId);
+
+      if (folderItems.length < 1) return STATE_ENABLED;
+      return store.disabledFolders?.[groupId] ? STATE_DISABLED : STATE_ENABLED;
+    }
+
+    function getScriptType() {
+      if (scope === 'global') return 0;
+      if (scope === 'scoped') return 1;
+      if (scope === 'preset') return 2;
+      return -1;
+    }
+
+    function getScriptsByCurrentScope(ctx = getCtx()) {
+      const scriptType = getScriptType();
+      if (scriptType === 0) return Array.isArray(ctx?.extensionSettings?.regex) ? ctx.extensionSettings.regex : [];
+      if (scriptType === 1) {
+        const character = ctx?.characters?.[ctx?.characterId];
+        const scopedScripts = character?.data?.extensions?.regex_scripts;
+        return Array.isArray(scopedScripts) ? scopedScripts : [];
+      }
+      if (scriptType === 2) {
+        const presetManager = getRegexPresetManager(ctx);
+        const presetScripts = presetManager?.readPresetExtensionField?.({ path: 'regex_scripts' });
+        return Array.isArray(presetScripts) ? presetScripts : [];
+      }
+      return [];
+    }
+
+    async function saveScriptsForCurrentScope(nextScripts, ctx = getCtx()) {
+      const scriptType = getScriptType();
+      if (scriptType === 0) {
+        if (ctx?.extensionSettings) ctx.extensionSettings.regex = nextScripts;
+        ctx?.saveSettingsDebounced?.();
+        return;
+      }
+
+      if (scriptType === 1) {
+        const characterId = ctx?.characterId;
+        if (characterId === undefined || typeof ctx?.writeExtensionField !== 'function') return;
+        await ctx.writeExtensionField(characterId, 'regex_scripts', nextScripts);
+        return;
+      }
+
+      if (scriptType === 2) {
+        const presetManager = getRegexPresetManager(ctx);
+        const presetName = presetManager?.getSelectedPresetName?.();
+        if (!presetManager || !presetName) return;
+        await presetManager.writePresetExtensionField({ name: presetName, path: 'regex_scripts', value: nextScripts });
+      }
+    }
+
+    async function reloadRegexUi(ctx = getCtx()) {
+      if (typeof window.loadRegexScripts === 'function') {
+        await window.loadRegexScripts();
+      }
+      const currentChatId = ctx?.getCurrentChatId?.();
+      if (currentChatId) {
+        await ctx?.reloadCurrentChat?.();
+      }
+      await new Promise((resolve) => schedule(resolve));
+    }
+
+    function getFolderItemIds(groupId, items = collectItems()) {
+      return items
+        .filter((item) => (groupId === UNGROUPED_ID ? !store.assignments[item.id] : store.assignments[item.id] === groupId))
+        .map((item) => item.id);
+    }
+
+    function setFolderEnabled(groupId, enabled) {
+      const itemIds = new Set(getFolderItemIds(groupId));
+      if (itemIds.size < 1) return;
+
+      if (!store.disabledFolders || typeof store.disabledFolders !== 'object') {
+        store.disabledFolders = {};
+      }
+      if (!store.disabledSnapshots || typeof store.disabledSnapshots !== 'object') {
+        store.disabledSnapshots = {};
+      }
+
+      if (!enabled) {
+        store.disabledFolders[groupId] = true;
+      } else {
+        delete store.disabledFolders[groupId];
+      }
+
+      saveStore();
+      renderTree();
+    }
+
+    async function syncFolderDisableOverlay(items) {
+      const ctx = getCtx();
+      const currentScripts = getScriptsByCurrentScope(ctx);
+      if (!Array.isArray(currentScripts) || currentScripts.length < 1) return false;
+
+      const scriptsByItemId = new Map(
+        currentScripts
+          .filter((script) => !!script?.id)
+          .map((script) => [`dom:${script.id}`, script])
+      );
+
+      if (!store.disabledSnapshots || typeof store.disabledSnapshots !== 'object') {
+        store.disabledSnapshots = {};
+      }
+
+      const nextSnapshots = {};
+      for (const [groupId, snapshot] of Object.entries(store.disabledSnapshots)) {
+        nextSnapshots[groupId] = { ...snapshot };
+      }
+
+      let storeChanged = false;
+      const desiredDisabledByItemId = new Map();
+
+      for (const item of items) {
+        const groupId = store.assignments[item.id] || UNGROUPED_ID;
+        const currentScript = scriptsByItemId.get(item.id);
+        if (!currentScript) continue;
+
+        if (store.disabledFolders?.[groupId]) {
+          if (!nextSnapshots[groupId]) nextSnapshots[groupId] = {};
+          if (!Object.prototype.hasOwnProperty.call(nextSnapshots[groupId], item.id)) {
+            nextSnapshots[groupId][item.id] = !!currentScript.disabled;
+            storeChanged = true;
+          }
+          desiredDisabledByItemId.set(item.id, true);
+          continue;
+        }
+
+        for (const [snapshotGroupId, snapshot] of Object.entries(nextSnapshots)) {
+          if (!Object.prototype.hasOwnProperty.call(snapshot, item.id)) continue;
+          desiredDisabledByItemId.set(item.id, !!snapshot[item.id]);
+          delete snapshot[item.id];
+          storeChanged = true;
+          if (Object.keys(snapshot).length < 1) {
+            delete nextSnapshots[snapshotGroupId];
+          }
+          break;
+        }
+      }
+
+      const nextScripts = currentScripts.map((script) => {
+        if (!script?.id) return script;
+        const itemId = `dom:${script.id}`;
+        const shouldDisable = desiredDisabledByItemId.get(itemId);
+        if (shouldDisable === undefined || !!script.disabled === shouldDisable) return script;
+        return { ...script, disabled: shouldDisable };
+      });
+
+      const scriptsChanged = nextScripts.some((script, index) => script !== currentScripts[index]);
+
+      if (storeChanged) {
+        store.disabledSnapshots = nextSnapshots;
+        saveStore();
+      }
+
+      if (!scriptsChanged) return false;
+
+      await saveScriptsForCurrentScope(nextScripts, ctx);
+      await reloadRegexUi(ctx);
+      return true;
+    }
+
     function findGroupByNormalizedName(name, excludeGroupId = '') {
       const normalized = normalizeName(name);
       return store.groups.find((group) => group.id !== excludeGroupId && normalizeName(group.name) === normalized);
@@ -315,18 +521,18 @@
     function validateGroupName(name, excludeGroupId = '') {
       const normalized = normalizeName(name);
       if (!normalized) {
-        toast('分组名称不能为空', 'warning');
+        toast(`${FOLDER_LABEL}名称不能为空`, 'warning');
         return '';
       }
 
-      if (normalized === '未分组') {
-        toast('“未分组”是保留名称，不能使用', 'warning');
+      if (normalized === UNGROUPED_LABEL) {
+        toast(`“${UNGROUPED_LABEL}”是保留名称，不能使用`, 'warning');
         return '';
       }
 
       const duplicate = findGroupByNormalizedName(normalized, excludeGroupId);
       if (duplicate) {
-        toast('已存在同名分组', 'warning');
+        toast(`已存在同名${FOLDER_LABEL}`, 'warning');
         return '';
       }
 
@@ -400,6 +606,20 @@
         }
       }
 
+      for (const groupId of Object.keys(store.disabledFolders || {})) {
+        if (groupId !== UNGROUPED_ID && !validGroupIds.has(groupId)) {
+          delete store.disabledFolders[groupId];
+          changed = true;
+        }
+      }
+
+      for (const groupId of Object.keys(store.disabledSnapshots || {})) {
+        if (groupId !== UNGROUPED_ID && !validGroupIds.has(groupId)) {
+          delete store.disabledSnapshots[groupId];
+          changed = true;
+        }
+      }
+
       if (changed) saveStore();
     }
 
@@ -413,7 +633,7 @@
       const titleEl = headerEl.querySelector('[data-st-rmg-panel-toggle]');
       if (titleEl) {
         titleEl.setAttribute('aria-expanded', panelCollapsed ? 'false' : 'true');
-        titleEl.setAttribute('title', panelCollapsed ? '点击展开分组面板' : '点击收起分组面板');
+        titleEl.setAttribute('title', panelCollapsed ? `点击展开${FOLDER_LABEL}面板` : `点击收起${FOLDER_LABEL}面板`);
       }
     }
 
@@ -425,11 +645,14 @@
 
     function getGroupSignature() {
       return JSON.stringify(
-        getGroups().map((group) => ({
-          id: group.id,
-          name: group.name,
-          order: group.order
-        }))
+        {
+          groups: getGroups().map((group) => ({
+            id: group.id,
+            name: group.name,
+            order: group.order
+          })),
+          ungroupedCount: collectItems().filter((item) => !store.assignments[item.id]).length
+        }
       );
     }
 
@@ -448,10 +671,13 @@
       const groups = getGroups();
       selectEl.innerHTML = '';
 
-      const ungroupedOption = document.createElement('option');
-      ungroupedOption.value = UNGROUPED_ID;
-      ungroupedOption.textContent = '未分组';
-      selectEl.appendChild(ungroupedOption);
+      const ungroupedCount = collectItems().filter((item) => !store.assignments[item.id]).length;
+      if (ungroupedCount > 0) {
+        const ungroupedOption = document.createElement('option');
+        ungroupedOption.value = UNGROUPED_ID;
+        ungroupedOption.textContent = UNGROUPED_LABEL;
+        selectEl.appendChild(ungroupedOption);
+      }
 
       for (const group of groups) {
         const optionEl = document.createElement('option');
@@ -462,7 +688,7 @@
 
       selectEl.value = Array.from(selectEl.options).some((option) => option.value === previousValue)
         ? previousValue
-        : UNGROUPED_ID;
+        : (selectEl.options[0]?.value || '');
       selectedGroupId = selectEl.value || UNGROUPED_ID;
       lastRenderedGroupSignature = nextSignature;
     }
@@ -471,9 +697,9 @@
       if (!containerEl) return;
       containerEl.innerHTML = `
         <div class="st-rmg-group-actions">
-          <button type="button" class="menu_button interactable" id="${NEW_GROUP_ID}">新增分组</button>
-          <button type="button" class="menu_button interactable" id="${RENAME_GROUP_ID}">重命名分组</button>
-          <button type="button" class="menu_button interactable st-rmg-danger" id="${DELETE_GROUP_ID}">删除分组</button>
+          <button type="button" class="menu_button interactable" id="${NEW_GROUP_ID}">新增${FOLDER_LABEL}</button>
+          <button type="button" class="menu_button interactable" id="${RENAME_GROUP_ID}">重命名${FOLDER_LABEL}</button>
+          <button type="button" class="menu_button interactable st-rmg-danger" id="${DELETE_GROUP_ID}">删除${FOLDER_LABEL}</button>
         </div>
         <select id="${GROUP_SELECT_ID}" class="text_pole st-rmg-group-select"></select>
       `;
@@ -518,14 +744,34 @@
       listEl.classList.add(GROUPING_CLASS);
       const fragment = document.createDocumentFragment();
 
+      const showUngrouped = (itemsByGroup.get(UNGROUPED_ID) || []).length > 0;
+      if (!showUngrouped && store.collapsed[UNGROUPED_ID]) {
+        delete store.collapsed[UNGROUPED_ID];
+        saveStore();
+      }
+
       function pushHeader(groupId, title, count) {
         const header = document.createElement('div');
         header.className = 'st-rmg-group-header';
         header.dataset.groupId = groupId;
+        if (groupId !== UNGROUPED_ID) {
+          header.classList.add('st-rmg-folder-draggable');
+        }
+        const folderState = getFolderState(groupId, items);
+        const toggleTitle = folderState === STATE_DISABLED ? `启用${FOLDER_LABEL}` : `关闭${FOLDER_LABEL}`;
+        if (folderState === STATE_DISABLED) {
+          header.classList.add('st-rmg-folder-disabled');
+        }
         header.innerHTML = `
-          <span class="st-rmg-group-arrow">${store.collapsed[groupId] ? '▶' : '▼'}</span>
+          <span class="st-rmg-folder-handle" draggable="true" title="拖动排序" aria-label="拖动排序">&#8801;</span>
           <span class="st-rmg-group-name">${escapeHtml(title)}</span>
           <span class="st-rmg-group-count">(${count})</span>
+          <button type="button" class="st-rmg-folder-switch ${folderState === STATE_DISABLED ? 'is-off' : 'is-on'}" data-folder-toggle="${escapeHtml(groupId)}" title="${escapeHtml(toggleTitle)}" aria-pressed="${folderState === STATE_DISABLED ? 'false' : 'true'}">
+            <span class="st-rmg-folder-switch-track">
+              <span class="st-rmg-folder-switch-thumb"></span>
+            </span>
+          </button>
+          <span class="st-rmg-group-arrow">${store.collapsed[groupId] ? '>' : 'v'}</span>
         `;
         fragment.appendChild(header);
 
@@ -539,13 +785,24 @@
 
       function pushItem(item, hidden) {
         item.el.classList.toggle(HIDDEN_CLASS, hidden);
+        const groupId = store.assignments[item.id] || UNGROUPED_ID;
+        const isFolderDisabled = !!store.disabledFolders?.[groupId];
+        item.el.classList.toggle('st-rmg-folder-item-disabled', isFolderDisabled);
+        item.el.classList.toggle('st-rmg-folder-item-locked', isFolderDisabled);
+        const disableCheckbox = item.el.querySelector?.('.disable_regex');
+        if (disableCheckbox instanceof HTMLElement) {
+          disableCheckbox.disabled = isFolderDisabled;
+          disableCheckbox.title = isFolderDisabled ? `当前${FOLDER_LABEL}已关闭，无法单独切换` : '';
+        }
         item.el.style.removeProperty('order');
         fragment.appendChild(item.el);
       }
 
-      pushHeader(UNGROUPED_ID, '未分组', itemsByGroup.get(UNGROUPED_ID).length);
-      for (const item of itemsByGroup.get(UNGROUPED_ID)) {
-        pushItem(item, !!store.collapsed[UNGROUPED_ID]);
+      if (showUngrouped) {
+        pushHeader(UNGROUPED_ID, UNGROUPED_LABEL, itemsByGroup.get(UNGROUPED_ID).length);
+        for (const item of itemsByGroup.get(UNGROUPED_ID)) {
+          pushItem(item, !!store.collapsed[UNGROUPED_ID]);
+        }
       }
 
       for (const group of groups) {
@@ -692,6 +949,50 @@
       return undefined;
     }
 
+    function getFolderHeaderByGroupId(listEl, groupId) {
+      if (!listEl || !groupId) return null;
+      return Array.from(listEl.querySelectorAll('.st-rmg-group-header')).find((headerEl) => headerEl.dataset.groupId === groupId) || null;
+    }
+
+    function clearFolderDropIndicators(listEl = getListEl()) {
+      if (!listEl) return;
+      for (const headerEl of listEl.querySelectorAll('.st-rmg-group-header')) {
+        headerEl.classList.remove('st-rmg-folder-dragging', 'st-rmg-folder-drop-before', 'st-rmg-folder-drop-after');
+      }
+    }
+
+    function updateFolderDropIndicator(listEl, targetGroupId, placeAfter) {
+      clearFolderDropIndicators(listEl);
+
+      if (draggingFolderId) {
+        getFolderHeaderByGroupId(listEl, draggingFolderId)?.classList.add('st-rmg-folder-dragging');
+      }
+
+      if (!targetGroupId) return;
+      const targetHeaderEl = getFolderHeaderByGroupId(listEl, targetGroupId);
+      if (!targetHeaderEl) return;
+      targetHeaderEl.classList.add(placeAfter ? 'st-rmg-folder-drop-after' : 'st-rmg-folder-drop-before');
+    }
+
+    function reorderFolders(draggedGroupId, targetGroupId, placeAfter) {
+      if (!draggedGroupId || !targetGroupId || draggedGroupId === targetGroupId) return false;
+
+      const orderedGroups = getGroups().map((group) => ({ ...group }));
+      const draggedIndex = orderedGroups.findIndex((group) => group.id === draggedGroupId);
+      if (draggedIndex < 0) return false;
+
+      const [draggedGroup] = orderedGroups.splice(draggedIndex, 1);
+      const targetIndex = orderedGroups.findIndex((group) => group.id === targetGroupId);
+      if (targetIndex < 0) return false;
+
+      const insertIndex = targetIndex + (placeAfter ? 1 : 0);
+      orderedGroups.splice(insertIndex, 0, draggedGroup);
+      store.groups = orderedGroups.map((group, index) => ({ ...group, order: index + 1 }));
+      saveStore();
+      renderTree();
+      return true;
+    }
+
     function bindNativeSortableEvents(listEl = getListEl()) {
       const $ = getJQuery();
       if (!listEl || typeof $ !== 'function' || !$.fn?.sortable) return;
@@ -765,7 +1066,7 @@
     }
 
     async function addGroup() {
-      const name = validateGroupName(await openPrompt('输入分组名称，例如 A组 / B组'));
+      const name = validateGroupName(await openPrompt(`输入${FOLDER_LABEL}名称，例如 A文件夹 / B文件夹`));
       if (!name) return;
 
       store.groups.push({
@@ -781,7 +1082,7 @@
       const group = store.groups.find((entry) => entry.id === groupId);
       if (!group) return;
 
-      const nextName = validateGroupName(await openPrompt('输入新的分组名称', group.name), group.id);
+      const nextName = validateGroupName(await openPrompt(`输入新的${FOLDER_LABEL}名称`, group.name), group.id);
       if (!nextName) return;
 
       group.name = nextName;
@@ -793,7 +1094,7 @@
       const group = store.groups.find((entry) => entry.id === groupId);
       if (!group) return;
 
-      const ok = await openConfirm(`删除分组“${group.name}”后，该组中的正则会回到未分组，是否继续？`);
+      const ok = await openConfirm(`删除${FOLDER_LABEL}“${group.name}”后，该${FOLDER_LABEL}中的正则会回到${UNGROUPED_LABEL}，是否继续？`);
       if (!ok) return;
 
       store.groups = store.groups.filter((entry) => entry.id !== groupId);
@@ -805,7 +1106,7 @@
       renderTree();
     }
 
-    function renderTree() {
+    async function renderTree() {
       const headerEl = getHeaderEl();
       const listEl = getListEl();
       if (!headerEl || !listEl) return;
@@ -817,6 +1118,13 @@
         const items = collectItems(listEl);
         migrateLegacyAssignments(items);
         cleanupAssignments(items);
+        const overlayChanged = await syncFolderDisableOverlay(items);
+        if (overlayChanged) {
+          schedule(() => {
+            renderTree();
+          });
+          return;
+        }
 
         renderGroupedList(items);
         syncNativeSortableOptions(listEl);
@@ -882,8 +1190,30 @@
       listEl.dataset.stRmgBound = '1';
 
       listEl.addEventListener('click', (e) => {
+        const toggleBtn = e.target?.closest?.('[data-folder-toggle]');
+        if (toggleBtn) {
+          e.preventDefault();
+          e.stopPropagation();
+          const groupId = String(toggleBtn.dataset.folderToggle || UNGROUPED_ID);
+          const enabled = toggleBtn.classList.contains('is-off');
+          void setFolderEnabled(groupId, enabled);
+          return;
+        }
+
+        if (e.target?.closest?.('.st-rmg-folder-handle')) {
+          e.preventDefault();
+          e.stopPropagation();
+          return;
+        }
+
         const headerEl = e.target?.closest?.('.st-rmg-group-header');
         if (!headerEl) return;
+
+        if (Date.now() - lastFolderDragEndedAt < 250) {
+          e.preventDefault();
+          e.stopPropagation();
+          return;
+        }
 
         e.preventDefault();
         e.stopPropagation();
@@ -892,6 +1222,78 @@
         store.collapsed[groupId] = !store.collapsed[groupId];
         saveStore();
         renderTree();
+      });
+
+      listEl.addEventListener('dragstart', (e) => {
+        const handleEl = e.target?.closest?.('.st-rmg-folder-handle');
+        if (!handleEl) return;
+
+        const headerEl = handleEl.closest('.st-rmg-group-header.st-rmg-folder-draggable');
+        if (!headerEl) return;
+
+        draggingFolderId = String(headerEl.dataset.groupId || '');
+        folderDropTargetId = '';
+        folderDropAfter = false;
+        updateFolderDropIndicator(listEl, '', false);
+
+        try {
+          e.dataTransfer?.setData?.('text/plain', draggingFolderId);
+          if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
+        } catch {
+          // ignore
+        }
+      });
+
+      listEl.addEventListener('dragover', (e) => {
+        if (!draggingFolderId) return;
+
+        const targetHeaderEl = e.target?.closest?.('.st-rmg-group-header.st-rmg-folder-draggable');
+        if (!targetHeaderEl) {
+          updateFolderDropIndicator(listEl, '', false);
+          return;
+        }
+
+        const targetGroupId = String(targetHeaderEl.dataset.groupId || '');
+        if (!targetGroupId || targetGroupId === draggingFolderId) {
+          updateFolderDropIndicator(listEl, '', false);
+          return;
+        }
+
+        e.preventDefault();
+        const rect = targetHeaderEl.getBoundingClientRect();
+        const placeAfter = Number(e.clientY) > rect.top + rect.height / 2;
+        folderDropTargetId = targetGroupId;
+        folderDropAfter = placeAfter;
+        updateFolderDropIndicator(listEl, targetGroupId, placeAfter);
+
+        try {
+          if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+        } catch {
+          // ignore
+        }
+      });
+
+      listEl.addEventListener('drop', (e) => {
+        if (!draggingFolderId) return;
+        if (!folderDropTargetId || folderDropTargetId === draggingFolderId) return;
+
+        e.preventDefault();
+        e.stopPropagation();
+        lastFolderDragEndedAt = Date.now();
+        clearFolderDropIndicators(listEl);
+        reorderFolders(draggingFolderId, folderDropTargetId, folderDropAfter);
+        draggingFolderId = '';
+        folderDropTargetId = '';
+        folderDropAfter = false;
+      });
+
+      listEl.addEventListener('dragend', () => {
+        if (!draggingFolderId) return;
+        lastFolderDragEndedAt = Date.now();
+        draggingFolderId = '';
+        folderDropTargetId = '';
+        folderDropAfter = false;
+        clearFolderDropIndicators(listEl);
       });
     }
 
@@ -926,7 +1328,7 @@
           <div class="st-rmg-title-row st-rmg-panel-toggle" data-st-rmg-panel-toggle role="button" tabindex="0" aria-expanded="true">
             <div class="st-rmg-title-main">
               <span class="st-rmg-panel-arrow" data-st-rmg-panel-arrow>▼</span>
-              <b>${escapeHtml(titleText)}分组</b>
+              <b>${escapeHtml(titleText)}${FOLDER_LABEL}</b>
             </div>
           </div>
           <div class="st-rmg-panel-body">

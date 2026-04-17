@@ -93,13 +93,99 @@
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 4px 8px;
+  width: calc(100% - 4px);
+  box-sizing: border-box;
+  padding: 5px 10px;
   margin-top: 0;
   margin-bottom: 0;
   border-radius: 8px;
   border: 1px solid var(--mainColor, rgba(255, 255, 255, 0.14));
   background: rgba(120, 160, 255, 0.08);
   cursor: pointer;
+}
+
+.st-rmg-folder-disabled {
+  background: rgba(28, 34, 48, 0.82);
+  border-color: rgba(132, 150, 188, 0.42);
+  box-shadow: inset 0 0 0 1px rgba(18, 22, 32, 0.55);
+}
+
+.st-rmg-folder-handle {
+  flex: 0 0 auto;
+  color: rgba(220, 228, 245, 0.58);
+  font-size: 17px;
+  letter-spacing: -1px;
+  cursor: grab;
+  user-select: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 26px;
+  min-height: 28px;
+  padding-right: 6px;
+}
+
+.st-rmg-group-name {
+  min-width: 0;
+}
+
+.st-rmg-folder-switch {
+  margin-left: auto;
+  margin-right: 4px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.st-rmg-folder-switch-track {
+  display: inline-flex;
+  align-items: center;
+  width: 28px;
+  height: 15px;
+  padding: 1px;
+  border-radius: 999px;
+  background: rgba(255, 120, 120, 0.45);
+  transition: background 0.15s ease;
+}
+
+.st-rmg-folder-switch-thumb {
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.28);
+  transform: translateX(0);
+  transition: transform 0.15s ease;
+}
+
+.st-rmg-folder-switch.is-on .st-rmg-folder-switch-track {
+  background: rgba(120, 220, 155, 0.72);
+}
+
+.st-rmg-folder-switch.is-on .st-rmg-folder-switch-thumb {
+  transform: translateX(13px);
+}
+
+.st-rmg-folder-switch:focus-visible {
+  outline: 2px solid rgba(120, 200, 255, 0.9);
+  outline-offset: 2px;
+}
+
+.st-rmg-folder-draggable {
+  cursor: default;
+}
+
+.st-rmg-folder-dragging {
+  opacity: 0.6;
+}
+
+.st-rmg-folder-drop-before {
+  box-shadow: inset 0 2px 0 rgba(120, 200, 255, 0.9);
+}
+
+.st-rmg-folder-drop-after {
+  box-shadow: inset 0 -2px 0 rgba(120, 200, 255, 0.9);
 }
 
 .st-rmg-sort-anchor {
@@ -116,6 +202,24 @@
 
 .st-rmg-group-count {
   opacity: 0.7;
+}
+
+.st-rmg-group-arrow {
+  flex: 0 0 auto;
+  width: 16px;
+  text-align: center;
+  opacity: 0.75;
+  font-family: Consolas, monospace;
+}
+
+.st-rmg-folder-item-disabled {
+  opacity: 0.58;
+  filter: brightness(0.52) saturate(0.8);
+  background: rgba(18, 22, 32, 0.34);
+}
+
+.st-rmg-folder-item-locked {
+  pointer-events: none;
 }
 
 .st-rmg-danger {
